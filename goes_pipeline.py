@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import gzip
+import time
 import shutil
 import logging
 import argparse
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------
 BASE_URL = "https://academic.uprm.edu/hdc/solar/INSOLRICO/"
-
 CONVERSION_FACTOR = 1 / 8.64
 COLUMN_NAME = "irradiance_Wm2"
 FILENAME_RE = re.compile(r'^INSOLRICO\.(\d{4})(\d{3})\.gz$')
@@ -44,9 +44,13 @@ def doy_to_date(year: int, doy: int) -> datetime:
 def load_processed_log(log_path: str) -> pd.DataFrame:
     if os.path.exists(log_path):
         return pd.read_csv(log_path)
+    # Ensure parent dir exists when we first write later
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     return pd.DataFrame(columns=["date", "filename"])
 
 def save_processed_entry(log_path: str, date_str: str, file_name: str) -> None:
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     exists = os.path.exists(log_path)
     with open(log_path, 'a', newline='') as f:
         writer = csv.writer(f)
@@ -60,8 +64,16 @@ def save_processed_entry(log_path: str, date_str: str, file_name: str) -> None:
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = "etl-goes/1.0"
-    retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-    s.mount("https://", HTTPAdapter(max_retries=retries))
+    retries = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods={"HEAD", "GET"},
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 SESSION = make_session()
@@ -157,6 +169,7 @@ def append_to_combined_csv(df: pd.DataFrame, date_str: str, combined_path: str) 
         return
     df_out = df.copy()
     df_out.insert(0, "date", date_str)  # put "date" column first
+    os.makedirs(os.path.dirname(combined_path) or ".", exist_ok=True)
     write_header = not os.path.exists(combined_path)
     df_out.to_csv(combined_path, mode="a", index=False, header=write_header, float_format="%.5f")
 
@@ -174,6 +187,22 @@ def report_missing_dates(start_dt: datetime, end_dt: datetime, have_dates: set[s
     return missing
 
 # ---------------------------------------------------------------------
+# Deduplicate combined CSV (safety net)
+# ---------------------------------------------------------------------
+def dedupe_combined(combined_path: str) -> None:
+    if not os.path.exists(combined_path):
+        return
+    try:
+        df = pd.read_csv(combined_path)
+        if df.empty:
+            return
+        df = df.drop_duplicates(subset=["date", "longitude", "latitude"], keep="last")
+        df.to_csv(combined_path, index=False)
+        logger.info(f"Deduplicated combined CSV by ['date','longitude','latitude']: {combined_path}")
+    except Exception as e:
+        logger.warning(f"Could not deduplicate {combined_path}: {e}")
+
+# ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 def main(start_date: str,
@@ -184,7 +213,9 @@ def main(start_date: str,
          center_lat: float,
          center_lon: float,
          radius_km: float,
-         report_missing: bool) -> None:
+         report_missing: bool,
+         force: bool,
+         throttle_s: float) -> None:
 
     os.makedirs(local_download_dir, exist_ok=True)
     os.makedirs(os.path.dirname(combined_csv_path) or ".", exist_ok=True)
@@ -215,10 +246,10 @@ def main(start_date: str,
         logger.info(f"[{i}/{len(wanted)}] {file_name} -> {date_str}")
         gz_path = txt_path = None
         try:
-            # If we've already logged that date, skip it
-            # if date_str in processed_dates:
-            #     logger.debug(f"Date already processed (log): {date_str}")
-            #     continue
+            # Idempotency: skip if already processed (unless --force)
+            if (not force) and (date_str in processed_dates):
+                logger.debug(f"Date already processed (log): {date_str}")
+                continue
 
             url = BASE_URL + file_name
             gz_path = download_file(url, local_download_dir)
@@ -236,14 +267,20 @@ def main(start_date: str,
 
             append_to_combined_csv(df_filtered, date_str, combined_csv_path)
             logger.info(f"Appended {len(df_filtered)} rows to {combined_csv_path} for {date_str}")
+
+            # Cleanup gz after success (txt cleaned in finally)
             try:
                 if gz_path and os.path.exists(gz_path):
                     os.remove(gz_path)
             except Exception as ce:
                 logger.warning(f"Could not remove {gz_path}: {ce}")
-            
+
             save_processed_entry(log_csv_path, date_str, file_name)
             processed_dates.add(date_str)
+
+            # Gentle throttle between files
+            if throttle_s > 0:
+                time.sleep(throttle_s)
 
         except Exception as e:
             logger.error(f"Error processing {file_name}: {e}")
@@ -255,23 +292,28 @@ def main(start_date: str,
             except Exception as ce:
                 logger.warning(f"Cleanup failed for {txt_path}: {ce}")
 
+    # Safety: dedupe final combined CSV
+    dedupe_combined(combined_csv_path)
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download INSOLRICO and save a single combined CSV filtered by radius.")
-    parser.add_argument("--start", default="2024-09-01", help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",   default="2024-10-05", help="End date YYYY-MM-DD")
-    parser.add_argument("--cache", default="goes_data", help="Folder for downloaded .gz files")
-    parser.add_argument("--combined", default="data/goes_data/INSOLRICO_SanJoseLake_combined.csv",
-                        help="Output path for the combined CSV")
-    parser.add_argument("--log",   default="log/processed_lo_goes.csv", help="CSV of processed dates")
-    parser.add_argument("--lat",   type=float, default=18.425, help="Center latitude")
-    parser.add_argument("--lon",   type=float, default=-66.025, help="Center longitude")
-    parser.add_argument("--radius",type=float, default=3.0, help="Radius in km")
-    parser.add_argument("--report-missing", action="store_true", help="Report missing dates in the range")
+    p = argparse.ArgumentParser(description="Download INSOLRICO and save a single combined CSV filtered by radius.")
+    p.add_argument("--start", default="2024-09-01", help="Start date YYYY-MM-DD")
+    p.add_argument("--end",   default="2024-10-05", help="End date YYYY-MM-DD")
+    p.add_argument("--cache", default="data/goes_data/cache", help="Folder for downloaded .gz files")
+    p.add_argument("--combined", default="data/goes_data/INSOLRICO_SanJoseLake_combined.csv",
+                   help="Output path for the combined CSV")
+    p.add_argument("--log",   default="logs/processed_lo_goes.csv", help="CSV of processed dates")
+    p.add_argument("--lat",   type=float, default=18.425, help="Center latitude")
+    p.add_argument("--lon",   type=float, default=-66.025, help="Center longitude")
+    p.add_argument("--radius",type=float, default=3.0, help="Radius in km")
+    p.add_argument("--report-missing", action="store_true", help="Report missing dates in the range")
+    p.add_argument("--force", action="store_true", help="Process even if date is already in the processed log")
+    p.add_argument("--throttle", type=float, default=0.2, help="Pause (seconds) between processed files")
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
     main(
         start_date=args.start,
@@ -282,5 +324,7 @@ if __name__ == "__main__":
         center_lat=args.lat,
         center_lon=args.lon,
         radius_km=args.radius,
-        report_missing=args.report_missing
+        report_missing=args.report_missing,
+        force=args.force,
+        throttle_s=args.throttle
     )

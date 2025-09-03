@@ -1,267 +1,536 @@
-import argparse
-import datetime
-from datetime import datetime
-import logging
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-from pathlib import Path
-import shutil
-import eumdac
-import xarray as xr
-import numpy as np
-from shapely import geometry
+import csv
 import time
+import argparse
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+import numpy as np
 import pandas as pd
+import xarray as xr
+from shapely import geometry
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+import eumdac
 
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-def process_chlorophyll_data(datastore, longps, latgps, factor, start_date, end_date, collection_ids, download_dir, selected_products):
+def add_file_logger(log_dir: str, filename: str = "chlorophyll_pipeline.log", level: int = logging.INFO) -> str:
     """
-    Downloads and processes satellite chlorophyll data based on selected products, excluding tie_geo_coordinates.nc.
+    Add a FileHandler that writes runtime logs into log_dir/filename.
+    Returns the full path to the log file.
     """
-    directories = []
-    downloaded = []
-    max_retries = 3
-    retry_delay = 5
-    time_log_file = os.path.join(download_dir, 'time.txt')
-    total_time_spent = 0
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, filename)
+    fh = logging.FileHandler(path)
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    return path
 
-    directories_list_file = os.path.join(download_dir, 'products.txt')
+# ---------------------------------------------------------------------
+# Defaults / Constants
+# ---------------------------------------------------------------------
+DEFAULT_OUT_DIR = "data/chl_data"
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOG_CSV = "chl_processed_log.csv"
 
-    with open(time_log_file, 'w') as time_file:
-        time_file.write("Product ID,Time Spent (seconds)\n")
+DEFAULT_PRODUCT_PATTERNS = [
+    "chl_nn", "oa08_reflectance", "oa11_reflectance", "oa17_reflectance",
+    "iwv", "oa04_reflectance", "oa21_reflectance", "oa07_reflectance",
+    "chl_oc4me", "t865", "a865", "tsm_nn", "oa12_reflectance", "oa03_reflectance",
+    "oa16_reflectance", "oa01_reflectance", "oa06_reflectance", "par",
+    "adg443_nn", "kd490_m07", "oa02_reflectance", "oa09_reflectance",
+    "oa05_reflectance", "oa10_reflectance", "oa18_reflectance",
+    # required by the pipeline
+    "geo_coordinates", "wqsf",
+]
 
-    if os.path.exists(directories_list_file):
-        with open(directories_list_file, 'r') as file:
-            downloaded = [line.strip() for line in file.readlines()]
-    else:
-        with open(directories_list_file, 'w') as file:
-            pass
+# Never download entries that contain these tokens (lowercase, substring match)
+EXCLUDED_PATTERNS = {"tie_geo_coordinates"}
 
-    # Exclude tie_geo_coordinates.nc from the selected products
-    selected_products = [product for product in selected_products if product != "tie_geo_coordinates.nc"]
+MAX_RETRIES_DOWNLOAD = 3
+RETRY_DELAY_START = 5  # seconds
+RETRY_DELAY_MAX = 60   # seconds
 
-    # Define ROI as a closed polygon
-    roi_coords = [(longps + factor, latgps + factor),
-                  (longps - factor, latgps + factor),
-                  (longps - factor, latgps - factor),
-                  (longps + factor, latgps - factor),
-                  (longps + factor, latgps + factor)]
-    roi_wkt = "POLYGON((" + ", ".join([f"{lon} {lat}" for lon, lat in roi_coords]) + "))"
-
-    for collection_id in collection_ids:
-        selected_collection = datastore.get_collection(collection_id)
-
-        try:
-            products = selected_collection.search(geo=roi_wkt, dtstart=start_date, dtend=end_date)
-        except Exception as e:
-            print(f"Error searching products in {collection_id}: {e}")
-            continue
-
-        for product in products:
-            start_time = time.time()
-            product_id = product._id
-
-            if product_id in downloaded:
-                continue
-
-            entry_name = product_id.split('_')[7] if len(product_id.split('_')) > 7 else 'entry'
-            print(f"Processing product {product_id}")
-
-            downloaded_files = []
-
-            # **Step 1: Download all required files before processing**
-            for entry in product.entries:
-                if any(filename in entry for filename in selected_products):
-                    if "tie_geo_coordinates.nc" in entry:
-                        print(f"Skipping {entry} as per user request.")
-                        continue  # Skip downloading tie_geo_coordinates.nc
-
-                    attempt = 0
-                    while attempt < max_retries:
-                        try:
-                            file_path = os.path.join(download_dir, os.path.basename(entry))
-                            with product.open(entry=entry) as fsrc, open(file_path, mode='wb') as fdst:
-                                print(f'Downloading {fsrc.name} from {entry_name}. Attempt {attempt + 1}.')
-                                shutil.copyfileobj(fsrc, fdst)
-                                print(f'Download complete: {fsrc.name}')
-                            downloaded_files.append(file_path)
-                            break
-                        except Exception as e:
-                            attempt += 1
-                            print(f"Error downloading {entry}: {e}. Retrying in {retry_delay} seconds...")
-                            time.sleep(retry_delay)
-                            retry_delay = min(retry_delay * 2, 60)
-                    else:
-                        print(f"Persistent error in {entry}. Skipping...")
-                        continue
-
-            # **Step 2: Ensure all required fil es are downloaded before proceeding**
-            file_map = {os.path.basename(f): f for f in downloaded_files}
-            geo_path = file_map.get("geo_coordinates.nc")
-            flag_path = file_map.get("wqsf.nc")
-            chl_path = file_map.get("chl_nn.nc")
-
-            if not geo_path or not flag_path or not chl_path:
-                print(f"Missing one or more essential files for {entry_name}. Skipping processing.")
-                continue
-
-            directories.append(str(entry_name))
-            downloaded.append(product_id)
-
-            with open(directories_list_file, 'a') as file:
-                file.write(f"{product_id}\n")
-
-            # **Step 3: Process the downloaded files**
-            try:
-                # Load Geographic Data
-                geo_data = xr.open_dataset(geo_path)
-                lat, lon = geo_data['latitude'].data, geo_data['longitude'].data
-                geo_data.close()
-
-                # Create spatial mask
-                polygon = geometry.Polygon(roi_coords)
-                point_mask = np.array([polygon.contains(geometry.Point(x, y)) for x, y in zip(lon.flatten(), lat.flatten())]).reshape(lon.shape)
-
-                # Validate mask shape
-                if lat.shape != point_mask.shape:
-                    print(f"Warning: Shape mismatch detected for {entry_name}. Setting flag columns empty.")
-                    point_mask = np.zeros_like(lat, dtype=bool)  # Create an empty mask
-
-                # Convert to datetime object
-                datetime_obj = datetime.strptime(entry_name, "%Y%m%dT%H%M%S")
-
-                # Create DataFrame with datetime column
-                df = pd.DataFrame({
-                    "latitude": lat[point_mask],
-                    "longitude": lon[point_mask],
-                    "datetime": datetime_obj  # This adds the same datetime to all rows
-                })
-
-
-                # Process WQSF Flags
-                if flag_path:
-                    flag_data = xr.open_dataset(flag_path)
-                    wqsf_values = flag_data['WQSF'].data
-                    flag_data.close()
-                    df['INVALID'] = (wqsf_values[point_mask] & (1 << 0)) > 0
-                    df['WATER'] = (wqsf_values[point_mask] & (1 << 1)) > 0
-                    df['CLOUD'] = (wqsf_values[point_mask] & (1 << 2)) > 0
-                    df['LAND'] = (wqsf_values[point_mask] & (1 << 3)) > 0
-
-                # Define the path for the variable list file
-                var_list_file = os.path.join(download_dir, "var_names.txt")
-
-                # Load existing variable names if the file exists, otherwise create an empty set
-                if os.path.exists(var_list_file):
-                    with open(var_list_file, "r") as file:
-                        existing_vars = set(line.strip() for line in file.readlines())
-                else:
-                    existing_vars = set()
-
-                # Process Other NetCDF Variables
-                for file in downloaded_files:
-                    if file.endswith(".nc") and file not in [geo_path, flag_path]:
-                        try:
-                            with xr.open_dataset(file) as dataset:
-                                for var_name in dataset.data_vars:
-                                    var_data = dataset[var_name].data
-                                    if var_data.shape == lat.shape:
-                                        df[var_name] = var_data[point_mask]
-                                        existing_vars.add(var_name)  # Add new variable name to the set
-                                    else:
-                                        print(f"Shape mismatch for {var_name} in {file}. Skipping...")
-                        except Exception as e:
-                            print(f"Error processing {file}: {e}")
-
-                # Save the updated variable names back to the file
-                with open(var_list_file, "w") as file:
-                    for var in sorted(existing_vars):  # Sort for better readability
-                        file.write(var + "\n")
-
-                # **Step 4: Save CSV**
-                output_path = os.path.join(download_dir, f"{entry_name}.csv")
-                df.to_csv(output_path, index=False)
-                print(f"DataFrame saved at: {output_path}")
-
-            except Exception as e:
-                logging.error(f"Error processing files for {entry_name}: {e}")
-
-            finally:
-                # Clean up: Delete downloaded .nc files before moving to the next
-                for file in downloaded_files:
-                    if os.path.exists(file):
-                        os.remove(file)
-                print(f"Cleaned up temporary files for {entry_name}")
-
-            end_time = time.time()
-            time_spent = end_time - start_time
-            total_time_spent += time_spent
-
-            with open(time_log_file, 'a') as time_file:
-                time_file.write(f"{entry_name} -- {time_spent:.2f} seconds\n")
-            logging.info(f"Processing time: {entry_name} -- {time_spent:.2f} seconds")
-
-    logging.info(f"Total processing time: {total_time_spent:.2f} seconds")
-
-def km_to_degrees(km):
+# ---------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------
+def km_to_degrees(km: float) -> float:
+    """
+    Rough conversion: ~111.32 km per degree latitude.
+    Good enough for a square ROI around a small area.
+    """
     return km / 111.32
 
+def ensure_dir(path: str) -> None:
+    """Create directory if it does not exist."""
+    os.makedirs(path or ".", exist_ok=True)
 
-def main(args):
-    """product_list = [
-        "EOPMetadata.xml", "instrument_data.nc",
-        "iop_lsd.nc", "iop_nn.nc", "iwv.nc", "Oa01_reflectance.nc", "Oa02_reflectance.nc", 
-        "Oa03_reflectance.nc", "Oa04_reflectance.nc", "Oa05_reflectance.nc", "Oa06_reflectance.nc", 
-        "Oa07_reflectance.nc", "Oa08_reflectance.nc", "Oa09_reflectance.nc", "Oa10_reflectance.nc",
-        "Oa11_reflectance.nc", "Oa12_reflectance.nc", "Oa16_reflectance.nc","Oa17_reflectance.nc",
-        "Oa18_reflectance.nc", "Oa21_reflectance.nc","par.nc","tie_geo_coordinates.nc","tie_meteo.nc",
-        "time_coordinates.nc", "trsp.nc",  "tsm_nn.nc","w_aer.nc"
-    ]
+def normalize_tokens(csv_like: str) -> List[str]:
     """
-    credentials_file = Path.home() / ".eumdac" / "credentials"
+    Split a comma-separated string into lowercase tokens, trimmed.
+    Empty/None returns [].
+    """
+    if not csv_like:
+        return []
+    return [t.strip().lower() for t in csv_like.split(",") if t.strip()]
+
+# ---------------------------------------------------------------------
+# Processed log (idempotency)
+# ---------------------------------------------------------------------
+def load_processed_log(log_csv_path: str) -> pd.DataFrame:
+    """
+    Load the processed-log CSV (if present). Otherwise return an empty DataFrame
+    with the expected schema. Ensures the parent directory exists.
+    """
+    if os.path.exists(log_csv_path):
+        return pd.read_csv(log_csv_path)
+    ensure_dir(os.path.dirname(log_csv_path))
+    return pd.DataFrame(columns=["product_id", "entry_name", "collection_id", "status", "rows", "csv_file"])
+
+def save_processed_entry(log_csv_path: str,
+                         product_id: str,
+                         entry_name: str,
+                         collection_id: str,
+                         status: str,
+                         rows: int,
+                         csv_file: str = "") -> None:
+    """
+    Append a new row to the processed-log CSV.
+    """
+    ensure_dir(os.path.dirname(log_csv_path))
+    exists = os.path.exists(log_csv_path)
+    with open(log_csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(["product_id", "entry_name", "collection_id", "status", "rows", "csv_file"])
+        w.writerow([product_id, entry_name, collection_id, status, rows, csv_file])
+
+# ---------------------------------------------------------------------
+# Timeliness helpers — (prefer NT > STC > NR)
+# ---------------------------------------------------------------------
+def extract_entry_name_from_pid(pid: str) -> Optional[str]:
+    """
+    Extract the timestamp-like entry_name from the product_id.
+    For S3 OLCI IDs it is typically at index 7 after splitting by '_'.
+    """
+    parts = str(pid).split("_")
+    return parts[7] if len(parts) > 7 else None
+
+def timeliness_rank(pid: str) -> int:
+    """
+    Rank timeliness from best to worst:
+    NT (non-time-critical) > STC/ST > NR/NRT.
+    Returns higher number for better timeliness.
+    """
+    p = pid.upper()
+    if "_O_NT_" in p:                       # final
+        return 3
+    if "_O_STC_" in p or "_O_ST_" in p:     # final-ish
+        return 2
+    if "_O_NR_" in p or "_O_NRT_" in p:     # near-real-time
+        return 1
+    return 0
+
+def pick_best_timeliness_per_entry(products) -> list:
+    """
+    Collapse multiple products with the same entry_name, keeping only the one
+    with the best timeliness (highest timeliness_rank).
+    """
+    best = {}  # entry_name -> (rank, product)
+    for prod in products:
+        pid = getattr(prod, "_id", str(prod))
+        entry = extract_entry_name_from_pid(pid)
+        if not entry:
+            continue
+        r = timeliness_rank(pid)
+        prev = best.get(entry)
+        if (prev is None) or (r > prev[0]):
+            best[entry] = (r, prod)
+
+    # Keep chronological order by entry_name if it looks like YYYYMMDDTHHMMSS
+    return [bp[1] for entry, bp in sorted(best.items(), key=lambda kv: kv[0])]
+
+# ---------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------
+def build_roi_polygon(lon_center: float, lat_center: float, half_size_deg: float) -> Tuple[List[Tuple[float, float]], str]:
+    """
+    Build a closed square ROI polygon around (lon_center, lat_center) with +/- half_size_deg.
+    Returns the coordinate list and the WKT POLYGON representation.
+    """
+    roi_coords = [
+        (lon_center + half_size_deg, lat_center + half_size_deg),
+        (lon_center - half_size_deg, lat_center + half_size_deg),
+        (lon_center - half_size_deg, lat_center - half_size_deg),
+        (lon_center + half_size_deg, lat_center - half_size_deg),
+        (lon_center + half_size_deg, lat_center + half_size_deg),
+    ]
+    roi_wkt = "POLYGON((" + ", ".join([f"{lon} {lat}" for lon, lat in roi_coords]) + "))"
+    return roi_coords, roi_wkt
+
+def shutil_copyfileobj(src, dst, length: int = 1024 * 1024) -> None:
+    """
+    Chunked binary copy (default 1 MB) from a file-like src to a file-like dst.
+    """
+    while True:
+        buf = src.read(length)
+        if not buf:
+            break
+        dst.write(buf)
+
+def safe_download_entry(product, entry: str, dest_dir: str) -> Optional[str]:
+    """
+    Download a product 'entry' into dest_dir with exponential backoff and a .part temp file.
+    Returns the final path, or None on persistent failure.
+    """
+    filename = os.path.basename(entry)
+    final_path = os.path.join(dest_dir, filename)
+    tmp_path = final_path + ".part"
+
+    if os.path.exists(final_path):
+        return final_path
+
+    delay = RETRY_DELAY_START
+    for attempt in range(1, MAX_RETRIES_DOWNLOAD + 1):
+        try:
+            with product.open(entry=entry) as fsrc, open(tmp_path, "wb") as fdst:
+                logger.info(f"Downloading {filename} (attempt {attempt})")
+                shutil_copyfileobj(fsrc, fdst)
+            os.replace(tmp_path, final_path)
+            return final_path
+        except Exception as e:
+            logger.warning(f"Error downloading {filename}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            if attempt < MAX_RETRIES_DOWNLOAD:
+                time.sleep(min(delay, RETRY_DELAY_MAX))
+                delay *= 2
+            else:
+                logger.error(f"Persistent error downloading {filename}. Giving up.")
+                return None
+
+def find_any(file_map: dict, *candidates: str) -> Optional[str]:
+    """
+    Case-insensitive lookup: return the first matching file path from file_map
+    whose basename equals any candidate (string equality).
+    """
+    if not file_map:
+        return None
+    # exact first
+    for c in candidates:
+        if c in file_map:
+            return file_map[c]
+    # case-insensitive
+    lower_map = {k.lower(): v for k, v in file_map.items()}
+    for c in candidates:
+        v = lower_map.get(c.lower())
+        if v:
+            return v
+    return None
+
+def process_chlorophyll_data(datastore,
+                             lon: float,
+                             lat: float,
+                             radius_km: float,
+                             start_date: str,
+                             end_date: str,
+                             collection_ids: List[str],
+                             output_dir: str,
+                             selected_products: List[str],
+                             log_csv_path: str,
+                             force: bool = False,
+                             throttle_s: float = 0.2) -> None:
+    """
+    Download and process chlorophyll-related satellite products inside an ROI and date range.
+
+    - Idempotent by product_id: skip items already listed in the processed log (unless --force).
+    - For each product (scene), write one CSV with columns: latitude, longitude, datetime,
+      optional WQSF flags, and additional variables that match the geo grid shape.
+    - Option A: for each 'entry_name', keep only the best timeliness (NT > STC > NR).
+    """
+    ensure_dir(output_dir)
+
+    # Time logging CSV (one row per entry_name)
+    time_log_file = os.path.join(output_dir, "time_spent.csv")
+    ensure_dir(os.path.dirname(time_log_file))
+    with open(time_log_file, "w", newline="") as tf:
+        w = csv.writer(tf)
+        w.writerow(["entry_name", "seconds"])
+
+    # Load processed-ids (idempotency)
+    log_df = load_processed_log(log_csv_path)
+    processed_ids = set(log_df["product_id"]) if not log_df.empty else set()
+
+    # Build the wanted pattern list (lowercase) and apply exclusions
+    extra_patterns = [p.lower() for p in (selected_products or [])]
+    selected_patterns = list(dict.fromkeys(DEFAULT_PRODUCT_PATTERNS + extra_patterns))
+    selected_patterns = [p for p in selected_patterns if p not in EXCLUDED_PATTERNS]
+
+    # ROI polygon (square, degrees)
+    half_size_deg = km_to_degrees(radius_km)
+    roi_coords, roi_wkt = build_roi_polygon(lon, lat, half_size_deg)
+    polygon = geometry.Polygon(roi_coords)
+
+    total_time = 0.0
+
+    for collection_id in collection_ids:
+        coll = datastore.get_collection(collection_id)
+        logger.info(f"Searching products in {collection_id} for {start_date}..{end_date}")
+        try:
+            products = coll.search(geo=roi_wkt, dtstart=start_date, dtend=end_date)
+        except Exception as e:
+            logger.error(f"Error searching products in {collection_id}: {e}")
+            continue
+
+        # ---------------- Option A: keep only best timeliness per entry ----------------
+        products = pick_best_timeliness_per_entry(products)
+        # -----------------------------------------------------------------------------
+
+        for product in products:
+            product_id = getattr(product, "_id", None) or str(product)
+            if (not force) and (product_id in processed_ids):
+                logger.debug(f"Already processed: {product_id}. Skipping.")
+                continue
+
+            # Derive a timestamp-like entry name from the product_id as best effort
+            entry_name = extract_entry_name_from_pid(product_id) or datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+
+            logger.info(f"Processing product {product_id} (entry_name={entry_name})")
+            start_t = time.time()
+            downloaded_files: List[str] = []
+
+            # 1) Download required entries matching our patterns (case-insensitive, substring)
+            try:
+                for entry in product.entries:
+                    entry_base = os.path.basename(entry)
+                    entry_base_l = entry_base.lower()
+
+                    # exclude unwanted entries
+                    if any(ex in entry_base_l for ex in EXCLUDED_PATTERNS):
+                        logger.info(f"Skipping excluded entry: {entry_base}")
+                        continue
+
+                    # include if any wanted token is present
+                    if not any(pat in entry_base_l for pat in selected_patterns):
+                        continue
+
+                    path = safe_download_entry(product, entry, output_dir)
+                    if path:
+                        downloaded_files.append(path)
+
+                    if throttle_s > 0:
+                        time.sleep(throttle_s)
+            except Exception as e:
+                logger.error(f"Error while downloading entries for {product_id}: {e}")
+                _cleanup_files(downloaded_files)
+                save_processed_entry(log_csv_path, product_id, entry_name, collection_id, "download_error", 0, "")
+                continue
+
+            # 2) Map essential files; be tolerant to case
+            file_map = {os.path.basename(f): f for f in downloaded_files}
+            geo_path  = find_any(file_map, "geo_coordinates.nc")
+            flag_path = find_any(file_map, "wqsf.nc")
+            # main chlorophyll variables (we'll accept either; you can extend list if needed)
+            chl_nn_path    = find_any(file_map, "chl_nn.nc")
+            chl_oc4me_path = find_any(file_map, "chl_oc4me.nc")
+            chl_paths = [p for p in (chl_nn_path, chl_oc4me_path) if p]
+
+            if (geo_path is None) or (not chl_paths):
+                logger.warning("Missing required files (geo_coordinates or chlorophyll). Skipping scene.")
+                _cleanup_files(downloaded_files)
+                save_processed_entry(log_csv_path, product_id, entry_name, collection_id, "missing_files", 0, "")
+                continue
+
+            # 3) Process and write CSV
+            csv_out = os.path.join(output_dir, f"{entry_name}.csv")
+            rows_written = 0
+            try:
+                # Load geolocation arrays
+                with xr.open_dataset(geo_path) as geo_ds:
+                    lat_arr = geo_ds["latitude"].data
+                    lon_arr = geo_ds["longitude"].data
+
+                # Build ROI mask over the geolocation grid
+                flat_lon = lon_arr.flatten()
+                flat_lat = lat_arr.flatten()
+                mask_flat = np.array([
+                    polygon.contains(geometry.Point(x, y))
+                    for x, y in zip(flat_lon, flat_lat)
+                ])
+                mask = mask_flat.reshape(lat_arr.shape)
+
+                # Safety: if shapes don't match, write an empty mask
+                if lat_arr.shape != mask.shape:
+                    logger.warning(f"Mask shape mismatch for {entry_name}; writing empty mask.")
+                    mask = np.zeros_like(lat_arr, dtype=bool)
+
+                # Scene timestamp (same for all rows)
+                try:
+                    ts = datetime.strptime(entry_name, "%Y%m%dT%H%M%S")
+                except Exception:
+                    ts = datetime.utcnow()
+
+                df = pd.DataFrame({
+                    "latitude":  lat_arr[mask],
+                    "longitude": lon_arr[mask],
+                    "datetime":  ts
+                })
+
+                # Optional: WQSF flags
+                if flag_path and os.path.exists(flag_path):
+                    with xr.open_dataset(flag_path) as flag_ds:
+                        wqsf = flag_ds["WQSF"].data
+                    if wqsf.shape == lat_arr.shape:
+                        wqsf_masked = wqsf[mask]
+                        df["INVALID"] = (wqsf_masked & (1 << 0)) > 0
+                        df["WATER"]   = (wqsf_masked & (1 << 1)) > 0
+                        df["CLOUD"]   = (wqsf_masked & (1 << 2)) > 0
+                        df["LAND"]    = (wqsf_masked & (1 << 3)) > 0
+                    else:
+                        logger.warning(f"WQSF shape mismatch for {entry_name}. Skipping flags.")
+
+                # Track all variable names we've written (helps auditing)
+                var_list_file = os.path.join(output_dir, "var_names.txt")
+                seen_vars = set()
+                if os.path.exists(var_list_file):
+                    with open(var_list_file, "r") as f:
+                        seen_vars = {line.strip() for line in f if line.strip()}
+
+                # Add any additional .nc variables whose arrays match the geo grid shape
+                for fpath in downloaded_files:
+                    base = os.path.basename(fpath).lower()
+                    if fpath.endswith(".nc") and base not in {"geo_coordinates.nc", "wqsf.nc"}:
+                        try:
+                            with xr.open_dataset(fpath) as ds:
+                                for var_name, da in ds.data_vars.items():
+                                    v = da.data
+                                    if hasattr(v, "shape") and v.shape == lat_arr.shape:
+                                        df[var_name] = v[mask]
+                                        seen_vars.add(var_name)
+                        except Exception as e:
+                            logger.warning(f"Error reading {fpath}: {e}")
+
+                # Persist the variable name list (sorted for readability)
+                with open(var_list_file, "w") as f:
+                    for v in sorted(seen_vars):
+                        f.write(v + "\n")
+
+                # Save scene CSV
+                df.to_csv(csv_out, index=False)
+                rows_written = len(df)
+                logger.info(f"Wrote CSV: {csv_out} ({rows_written} rows)")
+
+                save_processed_entry(
+                    log_csv_path, product_id, entry_name, collection_id, "ok", rows_written, os.path.basename(csv_out)
+                )
+
+            except Exception as e:
+                logger.error(f"Processing error for {entry_name}: {e}")
+                save_processed_entry(log_csv_path, product_id, entry_name, collection_id, "process_error", 0, "")
+            finally:
+                _cleanup_files(downloaded_files)
+
+            # Timing for this scene
+            spent = time.time() - start_t
+            total_time += spent
+            _append_time(time_log_file, entry_name, spent)
+            logger.info(f"Processing time for {entry_name}: {spent:.2f}s")
+
+    logger.info(f"Total processing time: {total_time:.2f}s")
+
+def _cleanup_files(paths: List[str]) -> None:
+    """Delete temporary files if they exist; ignore errors."""
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+def _append_time(path: str, entry_name: str, seconds: float) -> None:
+    """Append a single timing row to time_spent.csv."""
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([entry_name, f"{seconds:.2f}"])
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Chlorophyll satellite data downloader/processor with idempotent logging (NT > STC > NR).")
+    parser.add_argument("--start", default="2025-06-13", help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",   default="2025-09-01", help="End date YYYY-MM-DD")
+
+    parser.add_argument("--lon", type=float, default=-117.31646, help="ROI center longitude")
+    parser.add_argument("--lat", type=float, default=32.92993,   help="ROI center latitude")
+    parser.add_argument("--radius-km", type=float, default=5.0,  help="ROI half-size in kilometers (square ROI)")
+
+    parser.add_argument("--collections", nargs="+", default=["EO:EUM:DAT:0407", "EO:EUM:DAT:0556"],
+                        help="EUMETSAT collection IDs to search")
+    parser.add_argument("--out", default=DEFAULT_OUT_DIR, help="Output directory for CSVs and helper files")
+
+    parser.add_argument("--products", type=str, default="",
+                        help="Extra comma-separated entry tokens to include (added to defaults). Case-insensitive, extension-agnostic.")
+    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Directory for logs")
+    parser.add_argument("--log-csv", default=DEFAULT_LOG_CSV, help="Processed-log CSV filename (inside --log-dir)")
+    parser.add_argument("--file-log", action="store_true", help="Also write a runtime .log file in --log-dir")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"], help="Console log level")
+
+    parser.add_argument("--force", action="store_true", help="Reprocess even if product_id is already in the processed log")
+    parser.add_argument("--throttle", type=float, default=0.2, help="Pause between entry downloads (seconds)")
+
+    args = parser.parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    # Optional runtime file logger
+    ensure_dir(args.log_dir)
+    log_csv_path = os.path.join(args.log_dir, args.log_csv)
+    if args.file_log:
+        fpath = add_file_logger(args.log_dir, level=getattr(logging, args.log_level))
+        logger.info(f"Runtime log file: {fpath}")
+
+    # EUMDAC credentials (~/.eumdac/credentials: 'user,pass')
+    cred_file = Path.home() / ".eumdac" / "credentials"
     try:
-        credentials = credentials_file.read_text().split(",")
-        token = eumdac.AccessToken((credentials[0], credentials[1]))
-        logging.info(f"Token obtained. Expires on: {token.expiration}")
-    except (FileNotFoundError, IndexError):
-        logging.error("Error loading credentials.")
+        user, pwd = cred_file.read_text().split(",")
+        token = eumdac.AccessToken((user.strip(), pwd.strip()))
+        logger.info(f"Token obtained. Expires: {token.expiration}")
+    except Exception as e:
+        logger.error(f"Error loading EUMDAC credentials: {e}")
         return
 
     datastore = eumdac.DataStore(token)
-    download_dir = Path.home() / args.directory
-    download_dir.mkdir(parents=True, exist_ok=True)
 
-    factor = km_to_degrees(args.factor)
+    # Extra product tokens from CLI (lowercased)
+    extra = normalize_tokens(args.products)
 
-    # If products are provided via command-line, use them; otherwise, prompt user
-    default = ["chl_nn.nc", "chl_oc4me.nc", "wqsf.nc","geo_coordinates.nc"]
-    if args.products:
-        selected_products = default + [p.strip() for p in args.products.split(",")]
-    else:
-        selected_products = default
-    print(selected_products)
-    
     process_chlorophyll_data(
-        datastore, args.longps, args.latgps, factor, args.start_date, args.end_date,
-        args.collection_ids, str(download_dir), selected_products
+        datastore=datastore,
+        lon=args.lon,
+        lat=args.lat,
+        radius_km=args.radius_km,
+        start_date=args.start,
+        end_date=args.end,
+        collection_ids=args.collections,
+        output_dir=args.out,
+        selected_products=extra,
+        log_csv_path=log_csv_path,
+        force=args.force,
+        throttle_s=args.throttle
     )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Satellite Chlorophyll Data Processor")
-
-    # Required arguments
-    parser.add_argument("--longps", type=float, default=-117.31646, help="Longitud del ROI")
-    parser.add_argument("--latgps", type=float, default=32.92993, help="Latitud del ROI")
-    parser.add_argument("--factor", type=float, default= 5, help="Factor de expansión del ROI")
-    parser.add_argument("--start_date", type=str, default="2022-01-01", help="Fecha de inicio (YYYY-MM-DD)")
-    parser.add_argument("--end_date", type=str, default="2022-01-03", help="Fecha de fin (YYYY-MM-DD)")
-    parser.add_argument("--collection_ids", nargs="+", default=["EO:EUM:DAT:0407", "EO:EUM:DAT:0556"], help="Colecciones")
-    parser.add_argument("--directory", type=str, default="datos_delmarr_new", help="Directorio de salida")
-    parser.add_argument(
-        "--products",type=str,
-        help="Comma-separated list of products to download. Example: 'geo_coordinates.nc,wqsf.nc,Oa01_reflectance.nc'."
-    )
-    args = parser.parse_args()
-    main(args)
+    main()

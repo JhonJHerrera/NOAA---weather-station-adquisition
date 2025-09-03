@@ -2,6 +2,5 @@
 .DS_Store
 acis-env
 data
-combined
-combined2
-processed_log.csv
+logs
+/final_data
